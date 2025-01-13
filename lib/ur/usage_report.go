@@ -164,11 +164,11 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 			report.DeviceUses.CustomCertName++
 		}
 		switch cfg.Compression {
-		case protocol.CompressionAlways:
+		case config.CompressionAlways:
 			report.DeviceUses.CompressAlways++
-		case protocol.CompressionMetadata:
+		case config.CompressionMetadata:
 			report.DeviceUses.CompressMetadata++
-		case protocol.CompressionNever:
+		case config.CompressionNever:
 			report.DeviceUses.CompressNever++
 		default:
 			l.Warnf("Unhandled versioning type for usage reports: %s", cfg.Compression)
@@ -274,12 +274,30 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 			if cfg.Type == config.FolderTypeReceiveEncrypted {
 				report.FolderUsesV3.ReceiveEncrypted++
 			}
+			if cfg.SendXattrs {
+				report.FolderUsesV3.SendXattrs++
+			}
+			if cfg.SyncXattrs {
+				report.FolderUsesV3.SyncXattrs++
+			}
+			if cfg.SendOwnership {
+				report.FolderUsesV3.SendOwnership++
+			}
+			if cfg.SyncOwnership {
+				report.FolderUsesV3.SyncOwnership++
+			}
 		}
 		sort.Ints(report.FolderUsesV3.FsWatcherDelays)
 
 		for _, cfg := range s.cfg.Devices() {
 			if cfg.Untrusted {
 				report.DeviceUsesV3.Untrusted++
+			}
+			if cfg.MaxRecvKbps > 0 || cfg.MaxSendKbps > 0 {
+				report.DeviceUsesV3.UsesRateLimit++
+			}
+			if cfg.RawNumConnections > 1 {
+				report.DeviceUsesV3.MultipleConnections++
 			}
 		}
 
@@ -328,6 +346,11 @@ func (s *Service) reportData(ctx context.Context, urVersion int, preview bool) (
 }
 
 func (*Service) UptimeS() int {
+	// Handle nonexistent or wildly incorrect system clock.
+	// This code was written in 2023, it can't run in the past.
+	if StartTime.Year() < 2023 {
+		return 0
+	}
 	return int(time.Since(StartTime).Seconds())
 }
 
@@ -347,6 +370,8 @@ func (s *Service) sendUsageReport(ctx context.Context) error {
 			Proxy:       http.ProxyFromEnvironment,
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: s.cfg.Options().URPostInsecurely,
+				MinVersion:         tls.VersionTLS12,
+				ClientSessionCache: tls.NewLRUClientSessionCache(0),
 			},
 		},
 	}

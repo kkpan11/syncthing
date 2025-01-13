@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/syncthing/syncthing/lib/ignore/ignoreresult"
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
@@ -28,6 +29,7 @@ const (
 	filesystemWrapperTypeError
 	filesystemWrapperTypeWalk
 	filesystemWrapperTypeLog
+	filesystemWrapperTypeMetrics
 )
 
 type XattrFilter interface {
@@ -126,12 +128,7 @@ type Usage struct {
 }
 
 type Matcher interface {
-	ShouldIgnore(name string) bool
-	SkipIgnoredDirs() bool
-}
-
-type MatchResult interface {
-	IsIgnored() bool
+	Match(name string) ignoreresult.R
 }
 
 type Event struct {
@@ -172,21 +169,23 @@ var (
 
 // Equivalents from os package.
 
-const ModePerm = FileMode(os.ModePerm)
-const ModeSetgid = FileMode(os.ModeSetgid)
-const ModeSetuid = FileMode(os.ModeSetuid)
-const ModeSticky = FileMode(os.ModeSticky)
-const ModeSymlink = FileMode(os.ModeSymlink)
-const ModeType = FileMode(os.ModeType)
-const PathSeparator = os.PathSeparator
-const OptAppend = os.O_APPEND
-const OptCreate = os.O_CREATE
-const OptExclusive = os.O_EXCL
-const OptReadOnly = os.O_RDONLY
-const OptReadWrite = os.O_RDWR
-const OptSync = os.O_SYNC
-const OptTruncate = os.O_TRUNC
-const OptWriteOnly = os.O_WRONLY
+const (
+	ModePerm      = FileMode(os.ModePerm)
+	ModeSetgid    = FileMode(os.ModeSetgid)
+	ModeSetuid    = FileMode(os.ModeSetuid)
+	ModeSticky    = FileMode(os.ModeSticky)
+	ModeSymlink   = FileMode(os.ModeSymlink)
+	ModeType      = FileMode(os.ModeType)
+	PathSeparator = os.PathSeparator
+	OptAppend     = os.O_APPEND
+	OptCreate     = os.O_CREATE
+	OptExclusive  = os.O_EXCL
+	OptReadOnly   = os.O_RDONLY
+	OptReadWrite  = os.O_RDWR
+	OptSync       = os.O_SYNC
+	OptTruncate   = os.O_TRUNC
+	OptWriteOnly  = os.O_WRONLY
+)
 
 // SkipDir is used as a return value from WalkFuncs to indicate that
 // the directory named in the call is to be skipped. It is not returned
@@ -262,33 +261,51 @@ func NewFilesystem(fsType FilesystemType, uri string, opts ...Option) Filesystem
 		}
 	}
 
-	// Case handling is the innermost, as any filesystem calls by wrappers should be case-resolved
-	if caseOpt != nil {
-		fs = caseOpt.apply(fs)
-	}
-
 	// mtime handling should happen inside walking, as filesystem calls while
 	// walking should be mtime-resolved too
 	if mtimeOpt != nil {
 		fs = mtimeOpt.apply(fs)
 	}
 
+	fs = &metricsFS{next: fs}
+
+	layersAboveWalkFilesystem := 0
+	if caseOpt != nil {
+		// DirNames calls made to check the case of a name will also be
+		// attributed to the calling function.
+		layersAboveWalkFilesystem++
+	}
 	if l.ShouldDebug("walkfs") {
-		return NewWalkFilesystem(&logFilesystem{fs})
+		// A walkFilesystem is not a layer to skip, it embeds the underlying
+		// filesystem, passing calls directly trough. Except for calls made
+		// during walking, however those are truly originating in the walk
+		// filesystem.
+		fs = NewWalkFilesystem(newLogFilesystem(fs, layersAboveWalkFilesystem))
+	} else if l.ShouldDebug("fs") {
+		fs = newLogFilesystem(NewWalkFilesystem(fs), layersAboveWalkFilesystem)
+	} else {
+		fs = NewWalkFilesystem(fs)
 	}
 
-	if l.ShouldDebug("fs") {
-		return &logFilesystem{NewWalkFilesystem(fs)}
+	// Case handling is at the outermost layer to resolve all input names.
+	// Reason being is that the only names/paths that are potentially "wrong"
+	// come from outside the fs package. Any paths that result from filesystem
+	// operations itself already have the correct case. Thus there's e.g. no
+	// point to check the case on all the stating the walk filesystem does, it
+	// just adds overhead.
+	if caseOpt != nil {
+		fs = caseOpt.apply(fs)
 	}
 
-	return NewWalkFilesystem(fs)
+	return fs
 }
 
 // IsInternal returns true if the file, as a path relative to the folder
 // root, represents an internal file that should always be ignored. The file
 // path must be clean (i.e., in canonical shortest form).
 func IsInternal(file string) bool {
-	// fs cannot import config, so we hard code .stfolder here (config.DefaultMarkerName)
+	// fs cannot import config or versioner, so we hard code .stfolder
+	// (config.DefaultMarkerName) and .stversions (versioner.DefaultPath)
 	internals := []string{".stfolder", ".stignore", ".stversions"}
 	for _, internal := range internals {
 		if file == internal {
@@ -353,4 +370,21 @@ func unwrapFilesystem(fs Filesystem, wrapperType filesystemWrapperType) (Filesys
 			return nil, false
 		}
 	}
+}
+
+// WriteFile writes data to the named file, creating it if necessary.
+// If the file does not exist, WriteFile creates it with permissions perm (before umask);
+// otherwise WriteFile truncates it before writing, without changing permissions.
+// Since Writefile requires multiple system calls to complete, a failure mid-operation
+// can leave the file in a partially written state.
+func WriteFile(fs Filesystem, name string, data []byte, perm FileMode) error {
+	f, err := fs.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
+	if err1 := f.Close(); err1 != nil && err == nil {
+		err = err1
+	}
+	return err
 }

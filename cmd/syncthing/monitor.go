@@ -241,22 +241,6 @@ func copyStderr(stderr io.Reader, dst io.Writer) {
 		if panicFd == nil {
 			dst.Write([]byte(line))
 
-			if strings.Contains(line, "SIGILL") {
-				l.Warnln(`
-*******************************************************************************
-* Crash due to illegal instruction detected. This is most likely due to a CPU *
-* incompatibility with the high performance hashing package. Switching to the *
-* standard hashing package instead. Please report this issue at:              *
-*                                                                             *
-*   https://github.com/syncthing/syncthing/issues                             *
-*                                                                             *
-* Include the details of your CPU.                                            *
-*******************************************************************************
-`)
-				os.Setenv("STHASHING", "standard")
-				return
-			}
-
 			if strings.HasPrefix(line, "panic:") || strings.HasPrefix(line, "fatal error:") {
 				panicFd, err = os.Create(locations.GetTimestamped(locations.PanicLog))
 				if err != nil {
@@ -346,7 +330,7 @@ func restartMonitor(binary string, args []string) error {
 }
 
 func restartMonitorUnix(binary string, args []string) error {
-	return syscall.Exec(args[0], args, os.Environ())
+	return syscall.Exec(binary, args, os.Environ())
 }
 
 func restartMonitorWindows(binary string, args []string) error {
@@ -521,7 +505,7 @@ func (f *autoclosedFile) ensureOpenLocked() error {
 	// We open the file for write only, and create it if it doesn't exist.
 	flags := os.O_WRONLY | os.O_CREATE | os.O_APPEND
 
-	fd, err := os.OpenFile(f.name, flags, 0644)
+	fd, err := os.OpenFile(f.name, flags, 0o644)
 	if err != nil {
 		return err
 	}
