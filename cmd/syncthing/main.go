@@ -22,7 +22,6 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"runtime/pprof"
 	"sort"
 	"strconv"
@@ -32,11 +31,13 @@ import (
 
 	"github.com/alecthomas/kong"
 	"github.com/thejerf/suture/v4"
+	"github.com/willabides/kongplete"
 
 	"github.com/syncthing/syncthing/cmd/syncthing/cli"
 	"github.com/syncthing/syncthing/cmd/syncthing/cmdutil"
 	"github.com/syncthing/syncthing/cmd/syncthing/decrypt"
 	"github.com/syncthing/syncthing/cmd/syncthing/generate"
+	_ "github.com/syncthing/syncthing/lib/automaxprocs"
 	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/db"
@@ -88,16 +89,13 @@ above.
  STTRACE           A comma separated string of facilities to trace. The valid
                    facility strings are listed below.
 
- STDEADLOCKTIMEOUT Used for debugging internal deadlocks; sets debug
-                   sensitivity. Use only under direction of a developer.
-
  STLOCKTHRESHOLD   Used for debugging internal deadlocks; sets debug
                    sensitivity.  Use only under direction of a developer.
 
- STHASHING         Select the SHA256 hashing package to use. Possible values
-                   are "standard" for the Go standard library implementation,
-                   "minio" for the github.com/minio/sha256-simd implementation,
-                   and blank (the default) for auto detection.
+ STVERSIONEXTRA    Add extra information to the version string in logs and the
+                   version line in the GUI. Can be set to the name of a wrapper
+                   or tool controlling syncthing to communicate this to the end
+                   user.
 
  GOMAXPROCS        Set the maximum number of CPU cores to use. Defaults to all
                    available CPU cores.
@@ -131,10 +129,11 @@ var (
 // commands and options here are top level commands to syncthing.
 // Cli is just a placeholder for the help text (see main).
 var entrypoint struct {
-	Serve    serveOptions `cmd:"" help:"Run Syncthing"`
-	Generate generate.CLI `cmd:"" help:"Generate key and config, then exit"`
-	Decrypt  decrypt.CLI  `cmd:"" help:"Decrypt or verify an encrypted folder"`
-	Cli      struct{}     `cmd:"" help:"Command line interface for Syncthing"`
+	Serve              serveOptions                 `cmd:"" help:"Run Syncthing"`
+	Generate           generate.CLI                 `cmd:"" help:"Generate key and config, then exit"`
+	Decrypt            decrypt.CLI                  `cmd:"" help:"Decrypt or verify an encrypted folder"`
+	Cli                cli.CLI                      `cmd:"" help:"Command line interface for Syncthing"`
+	InstallCompletions kongplete.InstallCompletions `cmd:"" help:"Print commands to install shell completions"`
 }
 
 // serveOptions are the options for the `syncthing serve` command.
@@ -144,9 +143,9 @@ type serveOptions struct {
 	Audit            bool   `help:"Write events to audit file"`
 	AuditFile        string `name:"auditfile" placeholder:"PATH" help:"Specify audit file (use \"-\" for stdout, \"--\" for stderr)"`
 	BrowserOnly      bool   `help:"Open GUI in browser"`
-	DataDir          string `name:"data" placeholder:"PATH" help:"Set data directory (database and logs)"`
+	DataDir          string `name:"data" placeholder:"PATH" env:"STDATADIR" help:"Set data directory (database and logs)"`
 	DeviceID         bool   `help:"Show the device ID"`
-	GenerateDir      string `name:"generate" placeholder:"PATH" help:"Generate key and config in specified dir, then exit"` //DEPRECATED: replaced by subcommand!
+	GenerateDir      string `name:"generate" placeholder:"PATH" help:"Generate key and config in specified dir, then exit"` // DEPRECATED: replaced by subcommand!
 	GUIAddress       string `name:"gui-address" placeholder:"URL" help:"Override GUI address (e.g. \"http://192.0.2.42:8443\")"`
 	GUIAPIKey        string `name:"gui-apikey" placeholder:"API-KEY" help:"Override GUI API key"`
 	LogFile          string `name:"logfile" default:"${logFile}" placeholder:"PATH" help:"Log file name (see below)"`
@@ -168,7 +167,6 @@ type serveOptions struct {
 	// Debug options below
 	DebugDBIndirectGCInterval time.Duration `env:"STGCINDIRECTEVERY" help:"Database indirection GC interval"`
 	DebugDBRecheckInterval    time.Duration `env:"STRECHECKDBEVERY" help:"Database metadata recalculation interval"`
-	DebugDeadlockTimeout      int           `placeholder:"SECONDS" env:"STDEADLOCKTIMEOUT" help:"Used for debugging internal deadlocks"`
 	DebugGUIAssetsDir         string        `placeholder:"PATH" help:"Directory to load GUI assets from" env:"STGUIASSETS"`
 	DebugPerfStats            bool          `env:"STPERFSTATS" help:"Write running performance statistics to perf-$pid.csv (Unix only)"`
 	DebugProfileBlock         bool          `env:"STBLOCKPROFILE" help:"Write block profiles to block-$pid-$timestamp.pprof every 20 seconds"`
@@ -208,17 +206,6 @@ func defaultVars() kong.Vars {
 }
 
 func main() {
-	// The "cli" subcommand uses a different command line parser, and e.g. help
-	// gets mangled when integrating it as a subcommand -> detect it here at the
-	// beginning.
-	if len(os.Args) > 1 && os.Args[1] == "cli" {
-		if err := cli.Run(); err != nil {
-			fmt.Println(err)
-			os.Exit(1)
-		}
-		return
-	}
-
 	// First some massaging of the raw command line to fit the new model.
 	// Basically this means adding the default command at the front, and
 	// converting -options to --options.
@@ -244,11 +231,20 @@ func main() {
 
 	// Create a parser with an overridden help function to print our extra
 	// help info.
-	parser, err := kong.New(&entrypoint, kong.Help(helpHandler), defaultVars())
+	parser, err := kong.New(
+		&entrypoint,
+		kong.ConfigureHelp(kong.HelpOptions{
+			NoExpandSubcommands: true,
+			Compact:             true,
+		}),
+		kong.Help(helpHandler),
+		defaultVars(),
+	)
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	kongplete.Complete(parser)
 	ctx, err := parser.Parse(args)
 	parser.FatalIfErrorf(err)
 	ctx.BindTo(l, (*logger.Logger)(nil)) // main logger available to subcommands
@@ -354,7 +350,7 @@ func (options serveOptions) Run() error {
 	}
 
 	// Ensure that our home directory exists.
-	if err := syncthing.EnsureDir(locations.GetBaseDir(locations.ConfigBaseDir), 0700); err != nil {
+	if err := syncthing.EnsureDir(locations.GetBaseDir(locations.ConfigBaseDir), 0o700); err != nil {
 		l.Warnln("Failure on home directory:", err)
 		os.Exit(svcutil.ExitError.AsInt())
 	}
@@ -621,7 +617,6 @@ func syncthingMain(options serveOptions) {
 	}
 
 	appOpts := syncthing.Options{
-		DeadlockTimeoutS:     options.DebugDeadlockTimeout,
 		NoUpgrade:            options.NoUpgrade,
 		ProfilerAddr:         options.DebugProfilerListen,
 		ResetDeltaIdxs:       options.DebugResetDeltaIdxs,
@@ -631,10 +626,6 @@ func syncthingMain(options serveOptions) {
 	}
 	if options.Audit {
 		appOpts.AuditWriter = auditWriter(options.AuditFile)
-	}
-	if t := os.Getenv("STDEADLOCKTIMEOUT"); t != "" {
-		secs, _ := strconv.Atoi(t)
-		appOpts.DeadlockTimeoutS = secs
 	}
 	if dur, err := time.ParseDuration(os.Getenv("STRECHECKDBEVERY")); err == nil {
 		appOpts.DBRecheckInterval = dur
@@ -654,10 +645,6 @@ func syncthingMain(options serveOptions) {
 	}
 
 	setupSignalHandling(app)
-
-	if os.Getenv("GOMAXPROCS") == "" {
-		runtime.GOMAXPROCS(runtime.NumCPU())
-	}
 
 	if options.DebugProfileCPU {
 		f, err := os.Create(fmt.Sprintf("cpu-%d.pprof", os.Getpid()))
@@ -722,7 +709,6 @@ func setupSignalHandling(app *syncthing.App) {
 func loadOrDefaultConfig() (config.Wrapper, error) {
 	cfgFile := locations.Get(locations.ConfigFile)
 	cfg, _, err := config.Load(cfgFile, protocol.EmptyDeviceID, events.NoopLogger)
-
 	if err != nil {
 		newCfg := config.New(protocol.EmptyDeviceID)
 		return config.Wrap(cfgFile, newCfg, protocol.EmptyDeviceID, events.NoopLogger), nil
@@ -750,7 +736,7 @@ func auditWriter(auditFile string) io.Writer {
 		} else {
 			auditFlags = os.O_WRONLY | os.O_CREATE | os.O_APPEND
 		}
-		fd, err = os.OpenFile(auditFile, auditFlags, 0600)
+		fd, err = os.OpenFile(auditFile, auditFlags, 0o600)
 		if err != nil {
 			l.Warnln("Audit:", err)
 			os.Exit(svcutil.ExitError.AsInt())
@@ -870,6 +856,7 @@ func cleanConfigDirectory() {
 		"backup-of-v0.8":     30 * 24 * time.Hour, // these neither
 		"tmp-index-sorter.*": time.Minute,         // these should never exist on startup
 		"support-bundle-*":   30 * 24 * time.Hour, // keep old support bundle zip or folder for a month
+		"csrftokens.txt":     0,                   // deprecated, remove immediately
 	}
 
 	for pat, dur := range patterns {
